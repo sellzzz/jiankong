@@ -4,8 +4,8 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 
-ADDRESS = os.environ.get("WATCH_ADDRESS", "0x28816c4C4792467390C90e5B426F198570E29307").lower()
 RPC_URL = os.environ.get("BSC_RPC_URL", "https://bsc-dataseed.binance.org")
+ADDRESSES_FILE = os.environ.get("ADDRESSES_FILE", "/app/addresses.json")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "5"))
 STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
@@ -35,39 +35,60 @@ def rpc(method, params):
     return result["result"]
 
 
+def load_watchlist():
+    with open(ADDRESSES_FILE, "r", encoding="utf-8") as f:
+        entries = json.load(f)
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("addresses.json must contain at least one address")
+    watches = {}
+    for entry in entries:
+        address = entry["address"].lower()
+        if not address.startswith("0x") or len(address) != 42:
+            raise ValueError(f"Invalid address: {address}")
+        watches[address] = entry.get("name", address[:10] + "...")
+    return watches
+
+
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
     except FileNotFoundError:
-        return {"last_block": None, "seen": []}
+        return {"addresses": {}}
+    # Migrate the original single-address state format automatically.
+    if "addresses" not in state:
+        old_address = os.environ.get("WATCH_ADDRESS", "").lower()
+        return {"addresses": {old_address: {"last_block": state.get("last_block"), "seen": state.get("seen", [])}}}
+    return state
 
 
 def save_state(state):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    state["seen"] = state["seen"][-2000:]
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    for address_state in state["addresses"].values():
+        address_state["seen"] = address_state.get("seen", [])[-2000:]
+    temp_file = STATE_FILE + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(state, f)
+    os.replace(temp_file, STATE_FILE)
 
 
 def topic_address(topic):
     return "0x" + topic[-40:].lower() if topic else ""
 
 
-def describe(tx, receipt, block):
+def describe(tx, receipt, block, address):
     data = (tx.get("input") or "")[2:]
     method_id = data[:8].lower()
     method = METHODS.get(method_id, "contract_call" if data else "BNB_transfer")
     token_transfers = []
     for log in receipt.get("logs", []):
         topics = log.get("topics", [])
-        if len(topics) >= 3 and topics[0].lower().startswith(TRANSFER_TOPIC):
+        if len(topics) >= 3 and topics[0].lower() == TRANSFER_TOPIC:
             sender, recipient = topic_address(topics[1]), topic_address(topics[2])
-            if sender == ADDRESS:
+            if sender == address:
                 token_transfers.append({"token": log.get("address"), "to": recipient, "raw": int(topics[3], 16) if len(topics) > 3 else None})
     return {
         "hash": tx["hash"],
-        "block": int(tx["blockNumber"], 16),
         "time": datetime.fromtimestamp(int(block["timestamp"], 16), timezone.utc).isoformat(),
         "to": tx.get("to"),
         "method": method,
@@ -78,9 +99,10 @@ def describe(tx, receipt, block):
     }
 
 
-def format_message(item):
+def format_message(item, name, address):
     lines = [
         "🔔 BSC 主动操作",
+        f"地址: {name} ({address})",
         f"时间: {item['time']}",
         f"类型: {item['method']} ({item['status']})",
         f"目标: {item['to'] or '(合约创建)'}",
@@ -95,8 +117,8 @@ def format_message(item):
 
 def notify(message):
     print(message, flush=True)
-    payload = json.dumps({"content": message, "text": message}).encode()
     if WEBHOOK_URL:
+        payload = json.dumps({"content": message, "text": message}).encode()
         req = urllib.request.Request(WEBHOOK_URL, payload, {"Content-Type": "application/json"})
         try:
             urllib.request.urlopen(req, timeout=15).read()
@@ -113,30 +135,40 @@ def notify(message):
 
 
 def main():
-    print(f"Watching {ADDRESS} on BSC via {RPC_URL}", flush=True)
+    print(f"Watching addresses in {ADDRESSES_FILE} on BSC via {RPC_URL}", flush=True)
     state = load_state()
     while True:
         try:
+            watches = load_watchlist()
+            for address in watches:
+                state["addresses"].setdefault(address, {"last_block": None, "seen": []})
             latest = int(rpc("eth_blockNumber", []), 16)
-            if state["last_block"] is None:
-                state["last_block"] = latest
+            active = {address: state["addresses"][address] for address in watches}
+            baseline_addresses = [s for s in active.values() if s["last_block"] is None]
+            for address_state in baseline_addresses:
+                address_state["last_block"] = latest
+            if baseline_addresses:
                 save_state(state)
-                print(f"Baseline set at block {latest}", flush=True)
-            else:
-                start = max(state["last_block"] + 1, latest - 100)
-                for number in range(start, latest + 1):
-                    block = rpc("eth_getBlockByNumber", [hex(number), True])
-                    if not block:
+                print(f"Baseline set at block {latest} for {len(baseline_addresses)} address(es)", flush=True)
+            starts = [s["last_block"] + 1 for s in active.values()]
+            start = min(starts) if starts else latest + 1
+            start = max(start, latest - 100)
+            for number in range(start, latest + 1):
+                block = rpc("eth_getBlockByNumber", [hex(number), True])
+                if not block:
+                    continue
+                for tx in block.get("transactions", []):
+                    sender = (tx.get("from") or "").lower()
+                    if sender not in active or tx["hash"] in active[sender]["seen"]:
                         continue
-                    for tx in block.get("transactions", []):
-                        if (tx.get("from") or "").lower() != ADDRESS or tx["hash"] in state["seen"]:
-                            continue
-                        receipt = rpc("eth_getTransactionReceipt", [tx["hash"]])
-                        item = describe(tx, receipt, block)
-                        notify(format_message(item))
-                        state["seen"].append(tx["hash"])
-                    state["last_block"] = number
-                    save_state(state)
+                    receipt = rpc("eth_getTransactionReceipt", [tx["hash"]])
+                    item = describe(tx, receipt, block, sender)
+                    notify(format_message(item, watches[sender], sender))
+                    active[sender]["seen"].append(tx["hash"])
+                for address_state in active.values():
+                    if address_state["last_block"] < number:
+                        address_state["last_block"] = number
+                save_state(state)
             time.sleep(POLL_SECONDS)
         except Exception as exc:
             print(f"check error: {exc}", flush=True)
